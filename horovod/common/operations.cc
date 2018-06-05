@@ -36,6 +36,7 @@
 #endif
 
 #define OMPI_SKIP_MPICXX
+#include "half.h"
 #include "hashes.h"
 #include "mpi.h"
 #include "mpi_message.h"
@@ -184,6 +185,7 @@ struct HorovodGlobalState {
 
   // MPI custom data type for float16.
   MPI_Datatype mpi_float16_t;
+  MPI_Op mpi_float16_sum;
 
   // Private MPI communicator for Horovod to ensure no collisions with other
   // threads using MPI.
@@ -1131,8 +1133,11 @@ void PerformOperation(TensorTable& tensor_table, MPIResponse response) {
           MPI_CHECK(entries, "MPI_Allreduce",
                     MPI_Allreduce(MPI_IN_PLACE, host_buffer,
                                   (int)total_num_elements,
-                                  GetMPIDataType(first_entry.tensor), MPI_SUM,
-                                  horovod_global.cross_comm))
+                                  GetMPIDataType(first_entry.tensor),
+                                  first_entry.tensor->dtype() == HOROVOD_FLOAT16
+                                      ? horovod_global.mpi_float16_sum
+                                      : MPI_SUM,
+                                  , horovod_global.cross_comm))
           ACTIVITY_END_ALL(entries, timeline)
 
           ACTIVITY_START_ALL(entries, timeline, MEMCPY_OUT_HOST_BUFFER)
@@ -1263,7 +1268,10 @@ void PerformOperation(TensorTable& tensor_table, MPIResponse response) {
       MPI_CHECK(entries, "MPI_Allreduce",
                 MPI_Allreduce(MPI_IN_PLACE, (void*)buffer_data,
                               (int)num_elements,
-                              GetMPIDataType(first_entry.tensor), MPI_SUM,
+                              GetMPIDataType(first_entry.tensor),
+                              first_entry.tensor->dtype() == HOROVOD_FLOAT16
+                                  ? horovod_global.mpi_float16_sum
+                                  : MPI_SUM,
                               horovod_global.mpi_comm))
       ACTIVITY_END_ALL(entries, timeline)
 
@@ -1305,7 +1313,10 @@ void PerformOperation(TensorTable& tensor_table, MPIResponse response) {
       MPI_CHECK(entries, "MPI_Allreduce",
                 MPI_Allreduce(sendbuf, (void*)e.output->data(),
                               (int)e.tensor->shape().num_elements(),
-                              GetMPIDataType(e.tensor), MPI_SUM,
+                              GetMPIDataType(e.tensor),
+                              first_entry.tensor->dtype() == HOROVOD_FLOAT16
+                                  ? horovod_global.mpi_float16_sum
+                                  : MPI_SUM,
                               horovod_global.mpi_comm))
       ACTIVITY_END_ALL(entries, timeline)
     }
@@ -1395,6 +1406,22 @@ void CheckForStalledTensors(HorovodGlobalState& state) {
   }
 }
 
+// float16 custom data type summation operation.
+void float16_sum(void* invec, void* inoutvec, int* len,
+                 MPI_Datatype* datatype) {
+  // cast invec and inoutvec to your float16 type
+  auto* in = (unsigned short*)invec;
+  auto* inout = (unsigned short*)inoutvec;
+  for (int i = 0; i < *len; ++i) {
+    float in_float;
+    float inout_float;
+    HalfBits2Float(in + i, &in_float);
+    HalfBits2Float(inout + i, &inout_float);
+    inout_float += in_float;
+    Float2HalfBits(&inout_float, inout + i);
+  }
+}
+
 // The MPI background thread loop coordinates all the MPI processes and the
 // tensor reductions. The design of the communicator mechanism is limited by a
 // few considerations:
@@ -1431,7 +1458,7 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
   auto mpi_threads_disable = std::getenv(HOROVOD_MPI_THREADS_DISABLE);
   int required = MPI_THREAD_MULTIPLE;
   if (mpi_threads_disable != nullptr &&
-    std::strtol(mpi_threads_disable, nullptr, 10) > 0) {
+      std::strtol(mpi_threads_disable, nullptr, 10) > 0) {
     required = MPI_THREAD_SINGLE;
   }
   int provided;
@@ -1520,6 +1547,10 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
   MPI_Type_contiguous(2, MPI_BYTE, &mpi_float16_t);
   MPI_Type_commit(&mpi_float16_t);
 
+  // Create custom MPI float16 summation op.
+  MPI_Op mpi_float16_sum;
+  MPI_Op_create(&float16_sum, 1, &mpi_float16_sum);
+
   state.rank = rank;
   state.local_rank = local_rank;
   state.cross_rank = cross_rank;
@@ -1529,6 +1560,7 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
   state.local_comm = local_comm;
   state.cross_comm = cross_comm;
   state.mpi_float16_t = mpi_float16_t;
+  state.mpi_float16_sum = mpi_float16_sum;
   state.mpi_threads_supported = (provided == MPI_THREAD_MULTIPLE);
   state.local_comm_ranks = local_comm_ranks;
 
@@ -1572,9 +1604,10 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
 
   // Override Tensor Fusion threshold, if it's set.
   auto horovod_fusion_threshold = std::getenv("HOROVOD_FUSION_THRESHOLD");
-  int64_t proposed_fusion_threshold = (horovod_fusion_threshold != nullptr) ?
-        std::strtol(horovod_fusion_threshold, nullptr, 10) :
-        state.tensor_fusion_threshold;
+  int64_t proposed_fusion_threshold =
+      (horovod_fusion_threshold != nullptr)
+          ? std::strtol(horovod_fusion_threshold, nullptr, 10)
+          : state.tensor_fusion_threshold;
 
   // If the cluster is homogeneous and hierarchical allreduce is enabled,
   // adjust buffer size to make sure it is divisible by local_size to improve
@@ -1587,8 +1620,10 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
     // FUSION_BUFFER_ATOMIC_UNIT for performance
     int mpi_double_size;
     MPI_Type_size(MPI_DOUBLE, &mpi_double_size);
-    int64_t div = state.local_size * mpi_double_size * FUSION_BUFFER_ATOMIC_UNIT;
-    state.tensor_fusion_threshold = ((proposed_fusion_threshold+div-1) / div) * div;
+    int64_t div =
+        state.local_size * mpi_double_size * FUSION_BUFFER_ATOMIC_UNIT;
+    state.tensor_fusion_threshold =
+        ((proposed_fusion_threshold + div - 1) / div) * div;
   } else {
     state.tensor_fusion_threshold = proposed_fusion_threshold;
   }
@@ -1873,6 +1908,7 @@ bool RunLoopOnce(HorovodGlobalState& state, bool is_coordinator) {
   }
 
   return !should_shut_down;
+  MPI_Op_free(&state.mpi_float16_sum);
 }
 
 // Start Horovod background thread. Ensure that this is
