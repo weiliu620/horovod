@@ -42,6 +42,10 @@ check_extension('horovod.tensorflow', 'HOROVOD_WITH_TENSORFLOW', __file__, 'mpi_
 from horovod.tensorflow.mpi_ops import allgather
 from horovod.tensorflow.mpi_ops import broadcast
 from horovod.tensorflow.mpi_ops import _allreduce
+from horovod.tensorflow.mpi_ops import size_op
+from horovod.tensorflow.mpi_ops import local_size_op
+from horovod.tensorflow.mpi_ops import rank_op
+from horovod.tensorflow.mpi_ops import local_rank_op
 
 import tensorflow as tf
 
@@ -67,7 +71,7 @@ def allreduce(tensor, average=True, device_dense='', device_sparse=''):
     if isinstance(tensor, tf.IndexedSlices):
         with tf.device(device_sparse):
             # For IndexedSlices, do two allgathers intead of an allreduce.
-            horovod_size = tf.cast(size(), tensor.values.dtype)
+            horovod_size = tf.cast(size_op(), tensor.values.dtype)
             values = allgather(tensor.values)
             indices = allgather(tensor.indices)
 
@@ -78,7 +82,7 @@ def allreduce(tensor, average=True, device_dense='', device_sparse=''):
                                 dense_shape=tensor.dense_shape)
     else:
         with tf.device(device_dense):
-            horovod_size = tf.cast(size(), tensor.dtype)
+            horovod_size = tf.cast(size_op(), tensor.dtype)
             summed_tensor = _allreduce(tensor)
             new_tensor = (tf.div(summed_tensor, horovod_size)
                           if average else summed_tensor)
@@ -176,19 +180,20 @@ class DistributedOptimizer(tf.train.Optimizer):
         allreduce the gradients before returning them.
         """
         gradients = self._optimizer.compute_gradients(*args, **kwargs)
-        if size() > 1:
-            averaged_gradients = []
-            with tf.name_scope(self._name + "_Allreduce"):
-                for grad, var in gradients:
-                    if grad is not None:
-                        avg_grad = allreduce(grad, device_dense=self._device_dense,
-                                             device_sparse=self._device_sparse)
-                        averaged_gradients.append((avg_grad, var))
-                    else:
-                        averaged_gradients.append((None, var))
-            return averaged_gradients
-        else:
-            return gradients
+        averaged_gradients = []
+        with tf.name_scope(self._name + "_Allreduce"):
+            for grad, var in gradients:
+                if grad is not None:
+                    def allreduce_fn():
+                        return allreduce(grad, device_dense=self._device_dense,
+                                         device_sparse=self._device_sparse)
+                    def id_fn():
+                        return grad
+                    avg_grad = tf.cond(size_op() > 1, allreduce_fn, id_fn)
+                    averaged_gradients.append((avg_grad, var))
+                else:
+                    averaged_gradients.append((None, var))
+        return averaged_gradients
 
     def apply_gradients(self, *args, **kwargs):
         """Calls this same method on the underlying optimizer."""
