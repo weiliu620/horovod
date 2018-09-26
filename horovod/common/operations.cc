@@ -1137,7 +1137,7 @@ void PerformOperation(TensorTable& tensor_table, MPIResponse response) {
                                   first_entry.tensor->dtype() == HOROVOD_FLOAT16
                                       ? horovod_global.mpi_float16_sum
                                       : MPI_SUM,
-                                  , horovod_global.cross_comm))
+                                  horovod_global.cross_comm))
           ACTIVITY_END_ALL(entries, timeline)
 
           ACTIVITY_START_ALL(entries, timeline, MEMCPY_OUT_HOST_BUFFER)
